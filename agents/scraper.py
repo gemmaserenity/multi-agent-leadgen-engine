@@ -1,13 +1,15 @@
 """
 scraper.py
 
-Pulls raw leads from Proxycurl Person Search based on a loaded ICP profile.
-Outputs a timestamped CSV to /data and logs progress to /logs.
+Searches Google Custom Search API for companies matching the ICP profile.
+Extracts company name, website URL, and description from results.
+Deduplicates by domain and saves to data/raw_leads_{timestamp}.csv.
 
 Usage:
     python agents/scraper.py                        # uses config/icp_futuri.json
-    python agents/scraper.py --icp icp_custom.json  # uses config/icp_custom.json
-    python agents/scraper.py --dry-run              # prints params, makes no API calls
+    python agents/scraper.py --icp icp_custom.json
+    python agents/scraper.py --pages 3              # fetch up to 3 pages per query (default: 1)
+    python agents/scraper.py --dry-run              # print queries, no API calls
 """
 
 import argparse
@@ -19,6 +21,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -32,6 +35,37 @@ CONFIG_DIR = ROOT / "config"
 
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
+
+GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1"
+
+# More natural search terms per ICP industry label
+INDUSTRY_SEARCH_TERMS = {
+    "sports teams": "sports organization OR sports franchise OR sports team",
+    "enterprise companies": "enterprise company B2B",
+    "large sales organizations": "sales organization enterprise",
+}
+
+# Domains that produce noise — job boards, social, reference sites
+BLOCKED_DOMAINS = {
+    "indeed.com", "glassdoor.com", "ziprecruiter.com", "monster.com",
+    "careerbuilder.com", "simplyhired.com", "lever.co", "greenhouse.io",
+    "workday.com", "jobs.com", "twitter.com", "x.com", "facebook.com",
+    "instagram.com", "youtube.com", "tiktok.com", "wikipedia.org",
+    "wikihow.com", "quora.com", "reddit.com",
+}
+
+FIELDNAMES = [
+    "company",
+    "website",
+    "domain",
+    "description",
+    "industry_searched",
+    "title_searched",
+    "source",
+    "scraped_at",
+    "enriched",
+    "qualified",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -68,93 +102,151 @@ def load_icp(filename: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Proxycurl search
+# URL / domain helpers
 # ---------------------------------------------------------------------------
 
-PROXYCURL_SEARCH_URL = "https://nubela.co/proxycurl/api/v2/search/person/"
+def extract_domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower().removeprefix("www.")
+    except Exception:
+        return ""
 
-# Maps our plain-English industry labels to Proxycurl's industry filter values.
-# Extend as needed: https://nubela.co/proxycurl/docs#people-api-person-search-endpoint
-INDUSTRY_MAP = {
-    "sports teams": "sports",
-    "enterprise companies": "information technology and services",
-    "large sales organizations": "marketing and advertising",
-}
 
-def build_search_params(title: str, industry: str, page_size: int = 25) -> dict:
+def is_blocked(url: str) -> bool:
+    domain = extract_domain(url)
+    if not domain:
+        return True
+    if domain in BLOCKED_DOMAINS:
+        return True
+    # Skip LinkedIn individual profiles (/in/); keep company pages (/company/)
+    if "linkedin.com" in domain and "/in/" in urlparse(url).path:
+        return True
+    return False
+
+
+def extract_company_name(item: dict) -> str:
+    """
+    Best-effort company name from a CSE result.
+    Tries the first segment of the page title before a separator,
+    then falls back to a humanised domain name.
+    """
+    title = item.get("title", "").strip()
+    for sep in (" | ", " - ", " – ", " — "):
+        if sep in title:
+            candidate = title.split(sep)[0].strip()
+            if 2 <= len(candidate) <= 80:
+                return candidate
+    # Fall back: capitalise the SLD of the domain
+    domain = extract_domain(item.get("link", ""))
+    sld = domain.split(".")[0] if domain else ""
+    return sld.replace("-", " ").title() if sld else title[:80]
+
+
+# ---------------------------------------------------------------------------
+# Google CSE
+# ---------------------------------------------------------------------------
+
+def build_query(title: str, industry: str) -> str:
+    industry_terms = INDUSTRY_SEARCH_TERMS.get(industry, industry)
+    return f'"{title}" {industry_terms}'
+
+
+def fetch_cse_page(
+    query: str,
+    api_key: str,
+    cse_id: str,
+    page: int,
+    logger: logging.Logger,
+) -> list[dict]:
+    """Fetch one page (up to 10 results) from Google CSE."""
     params = {
-        "role": title,
-        "enrich_profile": "skip",
-        "page_size": page_size,
+        "key": api_key,
+        "cx": cse_id,
+        "q": query,
+        "num": 10,
+        "start": (page - 1) * 10 + 1,
     }
-    mapped = INDUSTRY_MAP.get(industry.lower())
-    if mapped:
-        params["industries"] = mapped
-    return params
-
-
-def fetch_page(api_key: str, params: dict, logger: logging.Logger) -> list[dict]:
-    resp = requests.get(
-        PROXYCURL_SEARCH_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        params=params,
-        timeout=30,
-    )
-
-    if resp.status_code == 429:
-        logger.warning("Rate limited — sleeping 60s")
-        time.sleep(60)
-        return fetch_page(api_key, params, logger)
-
-    if resp.status_code != 200:
-        logger.warning(f"Search returned {resp.status_code}: {resp.text[:200]}")
+    try:
+        resp = requests.get(GOOGLE_CSE_URL, params=params, timeout=15)
+    except requests.RequestException as e:
+        logger.warning(f"  Request error: {e}")
         return []
 
-    return resp.json().get("results", [])
+    if resp.status_code == 429:
+        logger.warning("  Google CSE rate limited — sleeping 60s")
+        time.sleep(60)
+        return fetch_cse_page(query, api_key, cse_id, page, logger)
+
+    if resp.status_code != 200:
+        logger.warning(f"  CSE {resp.status_code}: {resp.text[:200]}")
+        return []
+
+    return resp.json().get("items", [])
 
 
-def search_leads(icp: dict, logger: logging.Logger, dry_run: bool = False) -> list[dict]:
-    api_key = os.getenv("PROXYCURL_API_KEY", "").strip()
-    if not api_key and not dry_run:
-        raise EnvironmentError("PROXYCURL_API_KEY is not set in .env")
+def search_leads(
+    icp: dict,
+    logger: logging.Logger,
+    pages: int = 1,
+    dry_run: bool = False,
+) -> list[dict]:
+    api_key = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
+    cse_id = os.getenv("GOOGLE_CSE_ID", "").strip()
 
-    leads = []
-    seen_urls: set[str] = set()
+    if not dry_run:
+        missing = [k for k, v in {"GOOGLE_CSE_API_KEY": api_key, "GOOGLE_CSE_ID": cse_id}.items() if not v]
+        if missing:
+            raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
+
+    leads: list[dict] = []
+    seen_domains: set[str] = set()
 
     for title in icp["target_titles"]:
         for industry in icp["target_industries"]:
-            params = build_search_params(title, industry)
+            query = build_query(title, industry)
 
             if dry_run:
-                logger.info(f"[DRY RUN] Would search — title={title!r}, industry={industry!r}, params={params}")
+                logger.info(f"[DRY RUN] Would search: {query!r}")
                 continue
 
-            logger.info(f"Searching: {title!r} | {industry!r}")
-            results = fetch_page(api_key, params, logger)
-            logger.info(f"  → {len(results)} results")
+            logger.info(f"Searching: {query!r}")
 
-            for r in results:
-                url = r.get("linkedin_profile_url", "")
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
+            for page in range(1, pages + 1):
+                items = fetch_cse_page(query, api_key, cse_id, page, logger)
+                if not items:
+                    break
 
-                leads.append({
-                    "full_name": r.get("full_name", ""),
-                    "headline": r.get("headline", ""),
-                    "linkedin_url": url,
-                    "company": "",          # populated by enricher.py
-                    "email": "",            # populated by enricher.py
-                    "industry_searched": industry,
-                    "title_searched": title,
-                    "source": "proxycurl_search",
-                    "scraped_at": datetime.now().isoformat(),
-                    "enriched": "false",
-                    "qualified": "",
-                })
+                added = 0
+                for item in items:
+                    url = item.get("link", "")
+                    if not url or is_blocked(url):
+                        continue
 
-            # Proxycurl recommends >=1s between requests
-            time.sleep(1.2)
+                    domain = extract_domain(url)
+                    if domain in seen_domains:
+                        continue
+                    seen_domains.add(domain)
+
+                    leads.append({
+                        "company": extract_company_name(item),
+                        "website": url,
+                        "domain": domain,
+                        "description": item.get("snippet", "").replace("\n", " ").strip(),
+                        "industry_searched": industry,
+                        "title_searched": title,
+                        "source": "google_cse",
+                        "scraped_at": datetime.now().isoformat(),
+                        "enriched": "false",
+                        "qualified": "",
+                    })
+                    added += 1
+
+                logger.info(f"  Page {page}: {len(items)} results, {added} new companies added")
+
+                if len(items) < 10:
+                    break  # fewer than a full page means no more results
+
+                time.sleep(1)  # stay within CSE rate limits
 
     return leads
 
@@ -162,13 +254,6 @@ def search_leads(icp: dict, logger: logging.Logger, dry_run: bool = False) -> li
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-
-FIELDNAMES = [
-    "full_name", "headline", "linkedin_url", "company", "email",
-    "industry_searched", "title_searched", "source",
-    "scraped_at", "enriched", "qualified",
-]
-
 
 def save_leads(leads: list[dict], logger: logging.Logger) -> Path | None:
     if not leads:
@@ -183,7 +268,7 @@ def save_leads(leads: list[dict], logger: logging.Logger) -> Path | None:
         writer.writeheader()
         writer.writerows(leads)
 
-    logger.info(f"Saved {len(leads)} leads → {out_path.relative_to(ROOT)}")
+    logger.info(f"Saved {len(leads)} companies → {out_path.relative_to(ROOT)}")
     return out_path
 
 
@@ -192,9 +277,13 @@ def save_leads(leads: list[dict], logger: logging.Logger) -> Path | None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lead scraper — Proxycurl Person Search")
+    parser = argparse.ArgumentParser(description="Lead scraper — Google Custom Search")
     parser.add_argument("--icp", default="icp_futuri.json", help="ICP filename inside config/")
-    parser.add_argument("--dry-run", action="store_true", help="Print search params without hitting the API")
+    parser.add_argument(
+        "--pages", type=int, default=1,
+        help="Pages of CSE results to fetch per query, 10 results each (default: 1)",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Print queries without hitting the API")
     return parser.parse_args()
 
 
@@ -203,7 +292,7 @@ def main() -> None:
     logger = setup_logger("scraper")
     logger.info("=" * 60)
     logger.info("Scraper started")
-    logger.info(f"ICP: {args.icp} | dry_run={args.dry_run}")
+    logger.info(f"ICP: {args.icp} | pages={args.pages} | dry_run={args.dry_run}")
 
     try:
         icp = load_icp(args.icp)
@@ -211,8 +300,8 @@ def main() -> None:
         logger.info(f"Titles:     {icp['target_titles']}")
         logger.info(f"Industries: {icp['target_industries']}")
 
-        leads = search_leads(icp, logger, dry_run=args.dry_run)
-        logger.info(f"Total unique leads collected: {len(leads)}")
+        leads = search_leads(icp, logger, pages=args.pages, dry_run=args.dry_run)
+        logger.info(f"Total unique companies collected: {len(leads)}")
 
         out_path = save_leads(leads, logger)
         if out_path:
