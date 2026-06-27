@@ -42,11 +42,12 @@ SERPAPI_URL = "https://serpapi.com/search"
 
 # Domains that produce noise — job boards, social, reference sites
 BLOCKED_DOMAINS = {
+    "tealhq.com", "saastr.com", "jobtoday.com", "linkedin.com",
     "indeed.com", "glassdoor.com", "ziprecruiter.com", "monster.com",
-    "careerbuilder.com", "simplyhired.com", "lever.co", "greenhouse.io",
-    "workday.com", "jobs.com", "twitter.com", "x.com", "facebook.com",
-    "instagram.com", "youtube.com", "tiktok.com", "wikipedia.org",
-    "wikihow.com", "quora.com", "reddit.com",
+    "careerbuilder.com", "sportsvideo.org", "youtube.com", "twitter.com",
+    "facebook.com", "instagram.com", "wikipedia.org", "reddit.com",
+    "quora.com", "medium.com", "hubspot.com", "salesforce.com",
+    "forbes.com", "inc.com", "businessinsider.com",
 }
 
 FIELDNAMES = [
@@ -142,7 +143,7 @@ def extract_company_name(item: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def build_query(title: str, industry: str) -> str:
-    return f'"{title}" "{industry}" enterprise'
+    return f'"{title}" "{industry}" enterprise -job -jobs -hiring -career -careers -"job description"'
 
 
 def fetch_serpapi_page(
