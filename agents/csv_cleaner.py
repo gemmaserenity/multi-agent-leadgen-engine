@@ -29,22 +29,23 @@ LOG_DIR.mkdir(exist_ok=True)
 COLUMN_MAP = {
     "First Name":               "first_name",
     "Last Name":                "last_name",
-    "Title":                    "title",
+    "Title":                    "job_title",
     "Company Name - Cleaned":   "company",
     "Company Website Domain":   "domain",
-    "Email 1":                  "contact_email",
+    "Email 1":                  "email",
     "Contact LI Profile URL":   "linkedin_url",
     "Company Industry":         "company_industry",
     "Company Staff Count":      "company_size",
 }
 
 OUTPUT_FIELDS = [
+    "full_name",
     "first_name",
     "last_name",
-    "title",
+    "job_title",
     "company",
     "domain",
-    "contact_email",
+    "email",
     "linkedin_url",
     "company_industry",
     "company_size",
@@ -106,6 +107,7 @@ def clean(input_path: Path, output_path: Path, logger: logging.Logger) -> None:
             continue
 
         out = {dst: row.get(src, "").strip() for src, dst in COLUMN_MAP.items()}
+        out["full_name"] = " ".join(filter(None, [out.get("first_name"), out.get("last_name")]))
         out["location"] = build_location(row)
         kept.append(out)
 
