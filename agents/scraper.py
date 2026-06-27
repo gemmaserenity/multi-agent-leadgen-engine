@@ -1,16 +1,16 @@
 """
 scraper.py
 
-Searches SerpApi (Google engine) for companies matching the ICP profile.
-Extracts company name, website URL, and description from results.
+Searches Apollo.io People Search API for contacts matching the ICP profile.
+Finds real people at real companies — name, title, email, LinkedIn URL.
 Deduplicates by domain and saves to data/raw_leads_{timestamp}.csv.
 
 Usage:
     python agents/scraper.py                        # uses config/icp_futuri.json
     python agents/scraper.py --icp icp_custom.json
-    python agents/scraper.py --pages 3              # fetch up to 3 pages per query (default: 1)
-    python agents/scraper.py --limit 5              # stop after N unique companies
-    python agents/scraper.py --dry-run              # print queries, no API calls
+    python agents/scraper.py --pages 3              # fetch up to 3 pages, 25 results each (default: 1)
+    python agents/scraper.py --limit 50             # stop after N results
+    python agents/scraper.py --dry-run              # log search params, no API calls
 """
 
 import argparse
@@ -37,26 +37,16 @@ CONFIG_DIR = ROOT / "config"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-SERPAPI_URL = "https://serpapi.com/search"
-
-
-# Domains that produce noise — job boards, social, reference sites
-BLOCKED_DOMAINS = {
-    "tealhq.com", "saastr.com", "jobtoday.com", "linkedin.com",
-    "indeed.com", "glassdoor.com", "ziprecruiter.com", "monster.com",
-    "careerbuilder.com", "sportsvideo.org", "youtube.com", "twitter.com",
-    "facebook.com", "instagram.com", "wikipedia.org", "reddit.com",
-    "quora.com", "medium.com", "hubspot.com", "salesforce.com",
-    "forbes.com", "inc.com", "businessinsider.com",
-}
+APOLLO_SEARCH_URL = "https://api.apollo.io/v1/mixed_people/search"
 
 FIELDNAMES = [
+    "contact_name",
+    "contact_title",
+    "contact_email",
+    "linkedin_url",
     "company",
     "website",
     "domain",
-    "description",
-    "industry_searched",
-    "title_searched",
     "source",
     "scraped_at",
     "enriched",
@@ -98,92 +88,58 @@ def load_icp(filename: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# URL / domain helpers
+# Domain helper
 # ---------------------------------------------------------------------------
 
 def extract_domain(url: str) -> str:
+    if not url:
+        return ""
     try:
-        return urlparse(url).netloc.lower().removeprefix("www.")
+        netloc = urlparse(url).netloc.lower()
+        return netloc.removeprefix("www.")
     except Exception:
         return ""
 
 
-def is_blocked(url: str) -> bool:
-    domain = extract_domain(url)
-    if not domain:
-        return True
-    if domain in BLOCKED_DOMAINS:
-        return True
-    # Skip LinkedIn individual profiles (/in/); keep company pages (/company/)
-    if "linkedin.com" in domain and "/in/" in urlparse(url).path:
-        return True
-    return False
-
-
-def extract_company_name(item: dict) -> str:
-    """
-    Best-effort company name from a CSE result.
-    Tries the first segment of the page title before a separator,
-    then falls back to a humanised domain name.
-    """
-    title = item.get("title", "").strip()
-    for sep in (" | ", " - ", " – ", " — "):
-        if sep in title:
-            candidate = title.split(sep)[0].strip()
-            if 2 <= len(candidate) <= 80:
-                return candidate
-    # Fall back: capitalise the SLD of the domain
-    domain = extract_domain(item.get("link", ""))
-    sld = domain.split(".")[0] if domain else ""
-    return sld.replace("-", " ").title() if sld else title[:80]
-
-
 # ---------------------------------------------------------------------------
-# SerpApi
+# Apollo.io People Search
 # ---------------------------------------------------------------------------
 
-COMPANY_QUERIES = [
-    'site:linkedin.com/company "VP of Sales" "sports"',
-    '"enterprise sales team" "revenue intelligence" site:.com',
-    'NBA OR NFL OR MLB "enterprise sales" "revenue" contact',
-    '"large sales organization" "sales intelligence platform"',
-    '"sales enablement" "enterprise" "VP Sales" company',
-    'sports franchise "enterprise technology" "sales team"',
-    '"chief revenue officer" sports organization company',
-    'enterprise company "sales floor" "revenue intelligence"',
-]
-
-
-def fetch_serpapi_page(
-    query: str,
+def fetch_apollo_page(
     api_key: str,
+    titles: list[str],
     page: int,
     logger: logging.Logger,
 ) -> list[dict]:
-    """Fetch one page (up to 10 results) from SerpApi."""
-    params = {
+    """POST one page of Apollo People Search results (up to 25 per page)."""
+    payload = {
         "api_key": api_key,
-        "engine": "google",
-        "q": query,
-        "num": 10,
-        "start": (page - 1) * 10,
+        "person_titles": titles,
+        "organization_industry_tag_ids": [],
+        "organization_num_employees_ranges": ["100,10000"],
+        "page": page,
+        "per_page": 25,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
     }
     try:
-        resp = requests.get(SERPAPI_URL, params=params, timeout=15)
+        resp = requests.post(APOLLO_SEARCH_URL, json=payload, headers=headers, timeout=20)
     except requests.RequestException as e:
         logger.warning(f"  Request error: {e}")
         return []
 
     if resp.status_code == 429:
-        logger.warning("  SerpApi rate limited — sleeping 60s")
-        time.sleep(60)
-        return fetch_serpapi_page(query, api_key, page, logger)
+        logger.warning("  Apollo rate limited — sleeping 30s")
+        time.sleep(30)
+        return fetch_apollo_page(api_key, titles, page, logger)
 
     if resp.status_code != 200:
-        logger.warning(f"  SerpApi {resp.status_code}: {resp.text[:200]}")
+        logger.warning(f"  Apollo {resp.status_code}: {resp.text[:200]}")
         return []
 
-    return resp.json().get("organic_results", [])
+    return resp.json().get("people", [])
 
 
 def search_leads(
@@ -193,65 +149,69 @@ def search_leads(
     limit: int | None = None,
     dry_run: bool = False,
 ) -> list[dict]:
-    api_key = os.getenv("SERPAPI_KEY", "").strip()
+    api_key = os.getenv("APOLLO_API_KEY", "").strip()
 
     if not dry_run and not api_key:
-        raise EnvironmentError("SERPAPI_KEY is not set in .env")
+        raise EnvironmentError("APOLLO_API_KEY is not set in .env")
+
+    titles = icp.get("target_titles", [])
+
+    if dry_run:
+        logger.info(f"[DRY RUN] Would search Apollo with:")
+        logger.info(f"  person_titles: {titles}")
+        logger.info(f"  organization_num_employees_ranges: ['100,10000']")
+        logger.info(f"  pages: {pages}, per_page: 25")
+        return []
 
     leads: list[dict] = []
     seen_domains: set[str] = set()
 
-    for query in COMPANY_QUERIES:
-        if dry_run:
-            logger.info(f"[DRY RUN] Would search: {query!r}")
-            continue
+    for page in range(1, pages + 1):
+        logger.info(f"Fetching page {page} of {pages}…")
 
-        logger.info(f"Searching: {query!r}")
+        people = fetch_apollo_page(api_key, titles, page, logger)
+        if not people:
+            logger.info("  No results — stopping pagination")
+            break
 
-        for page in range(1, pages + 1):
-            items = fetch_serpapi_page(query, api_key, page, logger)
-            if not items:
-                break
-
-            added = 0
-            for item in items:
-                if limit is not None and len(leads) >= limit:
-                    break
-
-                url = item.get("link", "")
-                if not url or is_blocked(url):
-                    continue
-
-                domain = extract_domain(url)
-                if domain in seen_domains:
-                    continue
-                seen_domains.add(domain)
-
-                leads.append({
-                    "company": extract_company_name(item),
-                    "website": url,
-                    "domain": domain,
-                    "description": item.get("snippet", "").replace("\n", " ").strip(),
-                    "industry_searched": "",
-                    "title_searched": "",
-                    "source": "serpapi",
-                    "scraped_at": datetime.now().isoformat(),
-                    "enriched": "false",
-                    "qualified": "",
-                })
-                added += 1
-
-            logger.info(f"  Page {page}: {len(items)} results, {added} new companies added")
-
+        added = 0
+        for person in people:
             if limit is not None and len(leads) >= limit:
                 break
-            if len(items) < 10:
-                break  # fewer than a full page means no more results
 
-            time.sleep(1)  # stay within SerpApi rate limits
+            org = person.get("organization") or {}
+            domain = (
+                org.get("primary_domain")
+                or extract_domain(org.get("website_url", ""))
+            ).strip().lower()
+
+            if not domain or domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+
+            leads.append({
+                "contact_name":  person.get("name", ""),
+                "contact_title": person.get("title", ""),
+                "contact_email": person.get("email", "") or "",
+                "linkedin_url":  person.get("linkedin_url", "") or "",
+                "company":       org.get("name", ""),
+                "website":       org.get("website_url", "") or "",
+                "domain":        domain,
+                "source":        "apollo",
+                "scraped_at":    datetime.now().isoformat(),
+                "enriched":      "false",
+                "qualified":     "",
+            })
+            added += 1
+
+        logger.info(f"  Page {page}: {len(people)} people returned, {added} new companies added")
 
         if limit is not None and len(leads) >= limit:
             break
+        if len(people) < 25:
+            break  # fewer than a full page — no more results
+
+        time.sleep(1)
 
     return leads
 
@@ -273,7 +233,7 @@ def save_leads(leads: list[dict], logger: logging.Logger) -> Path | None:
         writer.writeheader()
         writer.writerows(leads)
 
-    logger.info(f"Saved {len(leads)} companies → {out_path.relative_to(ROOT)}")
+    logger.info(f"Saved {len(leads)} leads → {out_path.relative_to(ROOT)}")
     return out_path
 
 
@@ -282,14 +242,14 @@ def save_leads(leads: list[dict], logger: logging.Logger) -> Path | None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lead scraper — SerpApi Google Search")
+    parser = argparse.ArgumentParser(description="Lead scraper — Apollo.io People Search")
     parser.add_argument("--icp", default="icp_futuri.json", help="ICP filename inside config/")
     parser.add_argument(
         "--pages", type=int, default=1,
-        help="Pages of results to fetch per query, 10 results each (default: 1)",
+        help="Pages of Apollo results to fetch, 25 results each (default: 1)",
     )
-    parser.add_argument("--limit", type=int, default=None, help="Stop after collecting this many unique companies")
-    parser.add_argument("--dry-run", action="store_true", help="Print queries without hitting the API")
+    parser.add_argument("--limit", type=int, default=None, help="Stop after collecting this many leads")
+    parser.add_argument("--dry-run", action="store_true", help="Log search params without hitting the API")
     return parser.parse_args()
 
 
@@ -302,11 +262,12 @@ def main() -> None:
 
     try:
         icp = load_icp(args.icp)
-        logger.info(f"Client: {icp['client']} — Product: {icp['product']}")
-        logger.info(f"Queries: {len(COMPANY_QUERIES)}")
+        logger.info(f"Client:  {icp['client']} — Product: {icp['product']}")
+        logger.info(f"Titles:  {icp['target_titles']}")
+        logger.info(f"Min employees: {icp.get('company_size_min_employees', 100)}")
 
         leads = search_leads(icp, logger, pages=args.pages, limit=args.limit, dry_run=args.dry_run)
-        logger.info(f"Total unique companies collected: {len(leads)}")
+        logger.info(f"Total leads collected: {len(leads)}")
 
         out_path = save_leads(leads, logger)
         if out_path:
