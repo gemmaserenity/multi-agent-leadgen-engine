@@ -1,0 +1,11 @@
+{
+  "client": "Futuri",
+  "product": "TopLine Enterprise",
+  "target_industries": ["sports teams", "enterprise companies", "large sales organizations"],
+  "target_titles": ["VP of Sales", "Chief Revenue Officer", "SVP Sales", "Director of Sales"],
+  "company_size_min_employees": 100,
+  "contract_value_min": 50000,
+  "pain_point": "sales teams stuck in admin tools, not enough time selling",
+  "disqualifiers": ["small business", "solopreneur", "under 50 employees", "no sales team"],
+  "price_per_meeting": 1000
+}
