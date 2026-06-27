@@ -131,8 +131,7 @@ def _apollo_post(
     logger: logging.Logger,
     retries: int = 2,
 ) -> dict | None:
-    headers = {"Content-Type": "application/json", "Cache-Control": "no-cache"}
-    payload["api_key"] = api_key
+    headers = {"Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": api_key}
 
     for attempt in range(retries + 1):
         try:
