@@ -1,7 +1,7 @@
 """
 scraper.py
 
-Searches Google Custom Search API for companies matching the ICP profile.
+Searches SerpApi (Google engine) for companies matching the ICP profile.
 Extracts company name, website URL, and description from results.
 Deduplicates by domain and saves to data/raw_leads_{timestamp}.csv.
 
@@ -9,6 +9,7 @@ Usage:
     python agents/scraper.py                        # uses config/icp_futuri.json
     python agents/scraper.py --icp icp_custom.json
     python agents/scraper.py --pages 3              # fetch up to 3 pages per query (default: 1)
+    python agents/scraper.py --limit 5              # stop after N unique companies
     python agents/scraper.py --dry-run              # print queries, no API calls
 """
 
@@ -36,7 +37,7 @@ CONFIG_DIR = ROOT / "config"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1"
+SERPAPI_URL = "https://serpapi.com/search"
 
 
 # Domains that produce noise — job boards, social, reference sites
@@ -137,59 +138,56 @@ def extract_company_name(item: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google CSE
+# SerpApi
 # ---------------------------------------------------------------------------
 
 def build_query(title: str, industry: str) -> str:
     return f'"{title}" "{industry}" enterprise'
 
 
-def fetch_cse_page(
+def fetch_serpapi_page(
     query: str,
     api_key: str,
-    cse_id: str,
     page: int,
     logger: logging.Logger,
 ) -> list[dict]:
-    """Fetch one page (up to 10 results) from Google CSE."""
+    """Fetch one page (up to 10 results) from SerpApi."""
     params = {
-        "key": api_key,
-        "cx": cse_id,
+        "api_key": api_key,
+        "engine": "google",
         "q": query,
         "num": 10,
-        "start": (page - 1) * 10 + 1,
+        "start": (page - 1) * 10,
     }
     try:
-        resp = requests.get(GOOGLE_CSE_URL, params=params, timeout=15)
+        resp = requests.get(SERPAPI_URL, params=params, timeout=15)
     except requests.RequestException as e:
         logger.warning(f"  Request error: {e}")
         return []
 
     if resp.status_code == 429:
-        logger.warning("  Google CSE rate limited — sleeping 60s")
+        logger.warning("  SerpApi rate limited — sleeping 60s")
         time.sleep(60)
-        return fetch_cse_page(query, api_key, cse_id, page, logger)
+        return fetch_serpapi_page(query, api_key, page, logger)
 
     if resp.status_code != 200:
-        logger.warning(f"  CSE {resp.status_code}: {resp.text[:200]}")
+        logger.warning(f"  SerpApi {resp.status_code}: {resp.text[:200]}")
         return []
 
-    return resp.json().get("items", [])
+    return resp.json().get("organic_results", [])
 
 
 def search_leads(
     icp: dict,
     logger: logging.Logger,
     pages: int = 1,
+    limit: int | None = None,
     dry_run: bool = False,
 ) -> list[dict]:
-    api_key = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
-    cse_id = os.getenv("GOOGLE_CSE_ID", "").strip()
+    api_key = os.getenv("SERPAPI_KEY", "").strip()
 
-    if not dry_run:
-        missing = [k for k, v in {"GOOGLE_CSE_API_KEY": api_key, "GOOGLE_CSE_ID": cse_id}.items() if not v]
-        if missing:
-            raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
+    if not dry_run and not api_key:
+        raise EnvironmentError("SERPAPI_KEY is not set in .env")
 
     leads: list[dict] = []
     seen_domains: set[str] = set()
@@ -205,12 +203,15 @@ def search_leads(
             logger.info(f"Searching: {query!r}")
 
             for page in range(1, pages + 1):
-                items = fetch_cse_page(query, api_key, cse_id, page, logger)
+                items = fetch_serpapi_page(query, api_key, page, logger)
                 if not items:
                     break
 
                 added = 0
                 for item in items:
+                    if limit is not None and len(leads) >= limit:
+                        break
+
                     url = item.get("link", "")
                     if not url or is_blocked(url):
                         continue
@@ -227,7 +228,7 @@ def search_leads(
                         "description": item.get("snippet", "").replace("\n", " ").strip(),
                         "industry_searched": industry,
                         "title_searched": title,
-                        "source": "google_cse",
+                        "source": "serpapi",
                         "scraped_at": datetime.now().isoformat(),
                         "enriched": "false",
                         "qualified": "",
@@ -236,10 +237,17 @@ def search_leads(
 
                 logger.info(f"  Page {page}: {len(items)} results, {added} new companies added")
 
+                if limit is not None and len(leads) >= limit:
+                    break
                 if len(items) < 10:
                     break  # fewer than a full page means no more results
 
-                time.sleep(1)  # stay within CSE rate limits
+                time.sleep(1)  # stay within SerpApi rate limits
+
+            if limit is not None and len(leads) >= limit:
+                break
+        if limit is not None and len(leads) >= limit:
+            break
 
     return leads
 
@@ -270,12 +278,13 @@ def save_leads(leads: list[dict], logger: logging.Logger) -> Path | None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lead scraper — Google Custom Search")
+    parser = argparse.ArgumentParser(description="Lead scraper — SerpApi Google Search")
     parser.add_argument("--icp", default="icp_futuri.json", help="ICP filename inside config/")
     parser.add_argument(
         "--pages", type=int, default=1,
-        help="Pages of CSE results to fetch per query, 10 results each (default: 1)",
+        help="Pages of results to fetch per query, 10 results each (default: 1)",
     )
+    parser.add_argument("--limit", type=int, default=None, help="Stop after collecting this many unique companies")
     parser.add_argument("--dry-run", action="store_true", help="Print queries without hitting the API")
     return parser.parse_args()
 
@@ -293,7 +302,7 @@ def main() -> None:
         logger.info(f"Titles:     {icp['target_titles']}")
         logger.info(f"Industries: {icp['target_industries']}")
 
-        leads = search_leads(icp, logger, pages=args.pages, dry_run=args.dry_run)
+        leads = search_leads(icp, logger, pages=args.pages, limit=args.limit, dry_run=args.dry_run)
         logger.info(f"Total unique companies collected: {len(leads)}")
 
         out_path = save_leads(leads, logger)
