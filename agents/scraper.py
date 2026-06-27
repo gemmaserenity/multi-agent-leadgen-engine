@@ -37,7 +37,7 @@ CONFIG_DIR = ROOT / "config"
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-APOLLO_SEARCH_URL = "https://api.apollo.io/v1/mixed_people/search"
+APOLLO_SEARCH_URL = "https://api.apollo.io/v1/mixed_people/api_search"
 
 FIELDNAMES = [
     "contact_name",
