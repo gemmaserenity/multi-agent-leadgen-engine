@@ -115,7 +115,7 @@ def fetch_page(api_key: str, params: dict, logger: logging.Logger) -> list[dict]
 
 def search_leads(icp: dict, logger: logging.Logger, dry_run: bool = False) -> list[dict]:
     api_key = os.getenv("PROXYCURL_API_KEY", "").strip()
-    if not api_key:
+    if not api_key and not dry_run:
         raise EnvironmentError("PROXYCURL_API_KEY is not set in .env")
 
     leads = []
