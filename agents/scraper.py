@@ -113,7 +113,6 @@ def fetch_apollo_page(
 ) -> list[dict]:
     """POST one page of Apollo People Search results (up to 25 per page)."""
     payload = {
-        "api_key": api_key,
         "person_titles": titles,
         "organization_industry_tag_ids": [],
         "organization_num_employees_ranges": ["100,10000"],
@@ -123,6 +122,7 @@ def fetch_apollo_page(
     headers = {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
+        "X-Api-Key": api_key,
     }
     try:
         resp = requests.post(APOLLO_SEARCH_URL, json=payload, headers=headers, timeout=20)
