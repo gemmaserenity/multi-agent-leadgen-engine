@@ -142,8 +142,16 @@ def extract_company_name(item: dict) -> str:
 # SerpApi
 # ---------------------------------------------------------------------------
 
-def build_query(title: str, industry: str) -> str:
-    return f'"{title}" "{industry}" enterprise -job -jobs -hiring -career -careers -"job description"'
+COMPANY_QUERIES = [
+    'site:linkedin.com/company "VP of Sales" "sports"',
+    '"enterprise sales team" "revenue intelligence" site:.com',
+    'NBA OR NFL OR MLB "enterprise sales" "revenue" contact',
+    '"large sales organization" "sales intelligence platform"',
+    '"sales enablement" "enterprise" "VP Sales" company',
+    'sports franchise "enterprise technology" "sales team"',
+    '"chief revenue officer" sports organization company',
+    'enterprise company "sales floor" "revenue intelligence"',
+]
 
 
 def fetch_serpapi_page(
@@ -193,60 +201,55 @@ def search_leads(
     leads: list[dict] = []
     seen_domains: set[str] = set()
 
-    for title in icp["target_titles"]:
-        for industry in icp["target_industries"]:
-            query = build_query(title, industry)
+    for query in COMPANY_QUERIES:
+        if dry_run:
+            logger.info(f"[DRY RUN] Would search: {query!r}")
+            continue
 
-            if dry_run:
-                logger.info(f"[DRY RUN] Would search: {query!r}")
-                continue
+        logger.info(f"Searching: {query!r}")
 
-            logger.info(f"Searching: {query!r}")
+        for page in range(1, pages + 1):
+            items = fetch_serpapi_page(query, api_key, page, logger)
+            if not items:
+                break
 
-            for page in range(1, pages + 1):
-                items = fetch_serpapi_page(query, api_key, page, logger)
-                if not items:
-                    break
-
-                added = 0
-                for item in items:
-                    if limit is not None and len(leads) >= limit:
-                        break
-
-                    url = item.get("link", "")
-                    if not url or is_blocked(url):
-                        continue
-
-                    domain = extract_domain(url)
-                    if domain in seen_domains:
-                        continue
-                    seen_domains.add(domain)
-
-                    leads.append({
-                        "company": extract_company_name(item),
-                        "website": url,
-                        "domain": domain,
-                        "description": item.get("snippet", "").replace("\n", " ").strip(),
-                        "industry_searched": industry,
-                        "title_searched": title,
-                        "source": "serpapi",
-                        "scraped_at": datetime.now().isoformat(),
-                        "enriched": "false",
-                        "qualified": "",
-                    })
-                    added += 1
-
-                logger.info(f"  Page {page}: {len(items)} results, {added} new companies added")
-
+            added = 0
+            for item in items:
                 if limit is not None and len(leads) >= limit:
                     break
-                if len(items) < 10:
-                    break  # fewer than a full page means no more results
 
-                time.sleep(1)  # stay within SerpApi rate limits
+                url = item.get("link", "")
+                if not url or is_blocked(url):
+                    continue
+
+                domain = extract_domain(url)
+                if domain in seen_domains:
+                    continue
+                seen_domains.add(domain)
+
+                leads.append({
+                    "company": extract_company_name(item),
+                    "website": url,
+                    "domain": domain,
+                    "description": item.get("snippet", "").replace("\n", " ").strip(),
+                    "industry_searched": "",
+                    "title_searched": "",
+                    "source": "serpapi",
+                    "scraped_at": datetime.now().isoformat(),
+                    "enriched": "false",
+                    "qualified": "",
+                })
+                added += 1
+
+            logger.info(f"  Page {page}: {len(items)} results, {added} new companies added")
 
             if limit is not None and len(leads) >= limit:
                 break
+            if len(items) < 10:
+                break  # fewer than a full page means no more results
+
+            time.sleep(1)  # stay within SerpApi rate limits
+
         if limit is not None and len(leads) >= limit:
             break
 
@@ -300,8 +303,7 @@ def main() -> None:
     try:
         icp = load_icp(args.icp)
         logger.info(f"Client: {icp['client']} — Product: {icp['product']}")
-        logger.info(f"Titles:     {icp['target_titles']}")
-        logger.info(f"Industries: {icp['target_industries']}")
+        logger.info(f"Queries: {len(COMPANY_QUERIES)}")
 
         leads = search_leads(icp, logger, pages=args.pages, limit=args.limit, dry_run=args.dry_run)
         logger.info(f"Total unique companies collected: {len(leads)}")
