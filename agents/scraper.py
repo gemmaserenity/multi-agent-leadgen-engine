@@ -38,12 +38,6 @@ LOG_DIR.mkdir(exist_ok=True)
 
 GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1"
 
-# More natural search terms per ICP industry label
-INDUSTRY_SEARCH_TERMS = {
-    "sports teams": "sports organization OR sports franchise OR sports team",
-    "enterprise companies": "enterprise company B2B",
-    "large sales organizations": "sales organization enterprise",
-}
 
 # Domains that produce noise — job boards, social, reference sites
 BLOCKED_DOMAINS = {
@@ -147,8 +141,7 @@ def extract_company_name(item: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def build_query(title: str, industry: str) -> str:
-    industry_terms = INDUSTRY_SEARCH_TERMS.get(industry, industry)
-    return f'"{title}" {industry_terms}'
+    return f'"{title}" "{industry}" enterprise'
 
 
 def fetch_cse_page(
